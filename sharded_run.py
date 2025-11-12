@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse, json, os, time, math, sys, logging
 from pathlib import Path
 from typing import Optional, Union, Tuple, List, Dict
+
 import numpy as np
 import torch
 
@@ -102,7 +103,7 @@ def syn_r_ab(V_pre, sr, sd, Vth=-20.0, krel=2.0):
     return a, b, r_inf, tau_r
 
 # =========================================
-# Connectivity (COO only, per your edict)
+# Connectivity (COO only)
 # =========================================
 
 def _to_coo(M: torch.Tensor) -> Optional[torch.Tensor]:
@@ -164,13 +165,16 @@ def random_signed_adjacency_3to1(
     A_neg_coo = _to_coo(A_neg) if return_sparse else None
     return A, A_pos_coo, A_neg_coo, is_inh_col
 
+# =========================================
+# OU background source
+# =========================================
+
 class OUSource:
     def __init__(self, N, ge0, gi0, tau_e_ms, tau_i_ms, De, Di, dt_ms,
                  seed=None, device=None, dtype=torch.float32, logger: Optional[logging.Logger]=None):
         self.device = _dev() if device is None else device
         self.dtype = dtype
         self.logger = logger
-        # keep RNG on the instance
         self.rng = _gen(seed, self.device)
 
         def vec(x):
@@ -187,7 +191,6 @@ class OUSource:
         self.sig_e = torch.sqrt(self.De * self.tau_e * (1.0 - torch.exp(-2.0 * self.dt / self.tau_e)))
         self.sig_i = torch.sqrt(self.Di * self.tau_i * (1.0 - torch.exp(-2.0 * self.dt / self.tau_i)))
 
-        # ↓↓↓ replace randn_like(..., generator=...) with randn(..., generator=self.rng)
         self.ge = self.ge0 + torch.sqrt(self.De * self.tau_e) * torch.randn(
             self.ge0.shape, device=self.device, dtype=self.dtype, generator=self.rng
         )
@@ -202,7 +205,6 @@ class OUSource:
     @torch.no_grad()
     def step_pair(self):
         ge_now, gi_now = self.ge, self.gi
-        # ↓↓↓ also avoid randn_like here for reproducibility with the same RNG
         ge_next = self.ge0 + (self.ge - self.ge0) * self.he + self.sig_e * torch.randn(
             self.ge.shape, device=self.device, dtype=self.dtype, generator=self.rng
         )
@@ -212,13 +214,10 @@ class OUSource:
         self.ge, self.gi = ge_next, gi_next
         return ge_now, gi_now, ge_next, gi_next
 
-
 # =========================================
-# HH dynamics (2nd order, midpoint in state and time)
+# Background ratio helpers
 # =========================================
 
-
-#for tweaking the background drive
 def compute_bg_from_ratio(
     rho: float, Gbg: float, tau_e: float, tau_i: float,
     CVe: float = 0.3, CVi: float = 0.3
@@ -232,12 +231,13 @@ def compute_bg_from_ratio(
 def neutral_rho(Vstar: float, Ee: float = 0.0, Ei: float = -75.0) -> float:
     return (Ei - Vstar) / (Vstar - Ee)
 
+# =========================================
+# HH dynamics: positional core + kwargs shim
+# =========================================
 
-@torch.no_grad()
 def rl_update(x, x_inf, tau, dt):
     return x_inf + (x - x_inf) * torch.exp(-dt / torch.clamp(tau, min=1e-6))
 
-@torch.no_grad()
 def ionic_currents(V, m, h, n, p, params):
     ENa, EK, EL = params["ENa"], params["EK"], params["EL"]
     gNa, gK, gL = params["gNa"], params["gK"], params["gL"]
@@ -248,34 +248,31 @@ def ionic_currents(V, m, h, n, p, params):
     IL  = gL  * (V - EL)
     return INa + IK + IM + IL
 
-@torch.no_grad()
 def syn_current_point(V, ge, gi, Ee=0.0, Ei=-75.0):
     return ge * (V - Ee) + gi * (V - Ei)
 
-@torch.no_grad()
-def hh_step_second_order(
+# ---- positional-only inner kernel (no decorators) ----
+def _hh_step_pos(
     V, n, m, h, p, r,
-    dt_ms: float,
-    params: dict,
-    VT: torch.Tensor,
-    # time t inputs
-    ge_bg: Optional[torch.Tensor] = None,
-    gi_bg: Optional[torch.Tensor] = None,
-    Iext_t: Optional[torch.Tensor] = None,
-    # time t+dt inputs (for midpoint in time)
-    ge_bg_next: Optional[torch.Tensor] = None,
-    gi_bg_next: Optional[torch.Tensor] = None,
-    Iext_next: Optional[torch.Tensor] = None,
-    Aexc_coo: Optional[torch.Tensor] = None,
-    Ainh_coo: Optional[torch.Tensor] = None,
-    Vsyn_e: float = 20.0,
-    Vsyn_i: float = -80.0,
-    sr_ms: float = 0.5,
-    sd_ms: float = 8.0,
-    Vth_rel: float = -20.0,
-    krel: float = 2.0,
+    dt_ms,
+    params,
+    VT,
+    ge_bg,
+    gi_bg,
+    Iext_t,
+    ge_bg_next,
+    gi_bg_next,
+    Iext_next,
+    Aexc_coo,
+    Ainh_coo,
+    Vsyn_e,
+    Vsyn_i,
+    sr_ms,
+    sd_ms,
+    Vth_rel,
+    krel,
 ):
-    # ===== Stage 1: derivative at current state (Euler half-step predictor) =====
+    # Stage 1
     a_n0, b_n0, a_m0, b_m0, a_h0, b_h0 = rates_nmh(V, VT)
     n_inf0, tn0 = steady_state_and_tau(a_n0, b_n0)
     m_inf0, tm0 = steady_state_and_tau(a_m0, b_m0)
@@ -290,14 +287,14 @@ def hh_step_second_order(
     _, _, r_inf0, tau_r0 = syn_r_ab(V, sr=sr_ms, sd=sd_ms, Vth=Vth_rel, krel=krel)
     f_r0 = (r_inf0 - r) / torch.clamp(tau_r0, min=1e-6)
 
-    if ge_bg is not None and gi_bg is not None:
+    if (ge_bg is not None) and (gi_bg is not None):
         Isyn_bg0 = syn_current_point(V, ge_bg, gi_bg, params.get("Ee", 0.0), params.get("Ei", -75.0))
     else:
         Isyn_bg0 = torch.zeros_like(V)
 
     s_e0 = torch.zeros_like(V)
     s_i0 = torch.zeros_like(V)
-    if Aexc_coo is not None or Ainh_coo is not None:
+    if (Aexc_coo is not None) or (Ainh_coo is not None):
         if Aexc_coo is not None:
             s_e0 = torch.sparse.mm(Aexc_coo, r.unsqueeze(1)).squeeze(1)
         if Ainh_coo is not None:
@@ -318,7 +315,7 @@ def hh_step_second_order(
     p_t = p + half_dt * f_p0
     r_t = r + half_dt * f_r0
 
-    # ===== Stage 2: coefficients at (state midpoint, time midpoint) =====
+    # Stage 2
     a_n_t, b_n_t, a_m_t, b_m_t, a_h_t, b_h_t = rates_nmh(V_t, VT)
     n_inf_t, tn_t = steady_state_and_tau(a_n_t, b_n_t)
     m_inf_t, tm_t = steady_state_and_tau(a_m_t, b_m_t)
@@ -335,13 +332,12 @@ def hh_step_second_order(
 
     s_e_t = torch.zeros_like(V)
     s_i_t = torch.zeros_like(V)
-    if Aexc_coo is not None or Ainh_coo is not None:
+    if (Aexc_coo is not None) or (Ainh_coo is not None):
         if Aexc_coo is not None:
             s_e_t = torch.sparse.mm(Aexc_coo, r_t.unsqueeze(1)).squeeze(1)
         if Ainh_coo is not None:
             s_i_t = torch.sparse.mm(Ainh_coo, r_t.unsqueeze(1)).squeeze(1)
 
-    # time-midpoint for exogenous inputs
     def mid(a, b):
         if (a is not None) and (b is not None):
             return 0.5 * (a + b)
@@ -372,7 +368,6 @@ def hh_step_second_order(
     B_V = g_tot / params["Cm"]
     A_V = numA  / params["Cm"]
 
-    # Exponential Euler with phi1
     z = -B_V * dt_ms
     ez = torch.exp(z)
     phi1 = torch.where(torch.abs(z) < 1e-8, torch.ones_like(z), (torch.exp(z) - 1.0) / z)
@@ -380,12 +375,39 @@ def hh_step_second_order(
 
     return V_new, n_new, m_new, h_new, p_new, r_new
 
-# try torch.compile for speed
-try:
-    hh_step_second_order = torch.compile(hh_step_second_order, dynamic=True, mode="max-autotune")
-except Exception as _e:
-    # Fine, run uncompiled. Log at runtime.
-    pass
+# Global handle that the shim will call; main() may swap it to a compiled version
+HH_STEP_IMPL = _hh_step_pos
+
+# kwargs-friendly shim that calls positional core
+@torch.no_grad()
+def hh_step_second_order(
+    V, n, m, h, p, r,
+    dt_ms: float,
+    params: dict,
+    VT: torch.Tensor,
+    ge_bg: Optional[torch.Tensor] = None,
+    gi_bg: Optional[torch.Tensor] = None,
+    Iext_t: Optional[torch.Tensor] = None,
+    ge_bg_next: Optional[torch.Tensor] = None,
+    gi_bg_next: Optional[torch.Tensor] = None,
+    Iext_next: Optional[torch.Tensor] = None,
+    Aexc_coo: Optional[torch.Tensor] = None,
+    Ainh_coo: Optional[torch.Tensor] = None,
+    Vsyn_e: float = 20.0,
+    Vsyn_i: float = -80.0,
+    sr_ms: float = 0.5,
+    sd_ms: float = 8.0,
+    Vth_rel: float = -20.0,
+    krel: float = 2.0,
+):
+    return HH_STEP_IMPL(
+        V, n, m, h, p, r,
+        dt_ms, params, VT,
+        ge_bg, gi_bg, Iext_t,
+        ge_bg_next, gi_bg_next, Iext_next,
+        Aexc_coo, Ainh_coo,
+        Vsyn_e, Vsyn_i, sr_ms, sd_ms, Vth_rel, krel,
+    )
 
 # =========================================
 # Defaults
@@ -406,12 +428,11 @@ def rsa_default_params():
         smax=608.0,
     )
 
-
+# =========================================
+# NPZ shard writer
+# =========================================
 
 class NPZShardWriter:
-    """Writes samples to per-chunk .npz files with integer step metadata.
-    This makes shards stitchable for full-resolution spike detection.
-    """
     def __init__(self, outdir: Path, base: str, dt_ms: float, decimate: int, logger: logging.Logger, compress: bool = False):
         self.outdir = Path(outdir); self.outdir.mkdir(parents=True, exist_ok=True)
         self.base = base
@@ -422,23 +443,18 @@ class NPZShardWriter:
         self.compress = compress
 
     def write_chunk(self, step0: int, V_chunk: torch.Tensor):
-        """V_chunk: [rows, N] on CPU. Rows correspond to steps:
-           step = step0 + i*keep_every, i=0..rows-1
-        """
         assert V_chunk.device.type == "cpu", "write_chunk expects CPU tensor"
         rows, N = V_chunk.shape
-        step1 = step0 + rows * self.dec  # exclusive end step
+        step1 = step0 + rows * self.dec
         fn = self.outdir / f"{self.base}_shard{self.shard:05d}.npz"
         with Timer(self.log, f"write shard {self.shard} -> {fn.name}"):
             if self.compress:
                 np.savez_compressed(
                     fn,
                     V=V_chunk.numpy(),
-                    # integer continuity metadata (authoritative)
                     step0=np.int64(step0),
-                    step1=np.int64(step1),          # exclusive
-                    keep_every=np.int64(self.dec),  # step stride
-                    # convenience
+                    step1=np.int64(step1),
+                    keep_every=np.int64(self.dec),
                     dt_ms=np.float64(self.dt_ms),
                     N=np.int64(N),
                     dtype=np.bytes_(str(V_chunk.numpy().dtype)),
@@ -447,17 +463,18 @@ class NPZShardWriter:
                 np.savez(
                     fn,
                     V=V_chunk.numpy(),
-                    # integer continuity metadata (authoritative)
                     step0=np.int64(step0),
-                    step1=np.int64(step1),  # exclusive
-                    keep_every=np.int64(self.dec),  # step stride
-                    # convenience
+                    step1=np.int64(step1),
+                    keep_every=np.int64(self.dec),
                     dt_ms=np.float64(self.dt_ms),
                     N=np.int64(N),
                     dtype=np.bytes_(str(V_chunk.numpy().dtype)),
                 )
-
         self.shard += 1
+
+# =========================================
+# Simulation loop
+# =========================================
 
 @torch.no_grad()
 def run_network(
@@ -483,7 +500,6 @@ def run_network(
     seed: Optional[int] = 42,
     device: Optional[Union[str, torch.device]] = None,
     dtype: torch.dtype = torch.float32,
-    # chunking / recording
     chunk_steps: int = 2000,
     decimate: int = 1,
     writer: Optional[NPZShardWriter] = None,
@@ -529,22 +545,17 @@ def run_network(
     t_sim = time.perf_counter()
 
     while step < T_steps:
-        # chunk bounds
         s_end = min(step + chunk_steps, T_steps)
         logger.info(f"[chunk] steps {step}..{s_end-1} (len={s_end-step})")
 
-        # compute how many kept rows this chunk will produce, exactly
         steps_in_chunk = s_end - step
-        # first kept index within chunk is the smallest i >= 0 such that (step+i) % keep_every == 0
         offset = (-step) % keep_every
         first_kept = offset if offset < steps_in_chunk else steps_in_chunk
         n_keep = 0 if first_kept == steps_in_chunk else 1 + (steps_in_chunk - 1 - first_kept) // keep_every
 
-        # allocate CPU buffer for this chunk's kept rows (full res when keep_every==1)
         V_buf_cpu = torch.empty((n_keep, N), device="cpu", dtype=dtype)
         kept_idx = 0
 
-        # integrate this chunk
         while step < s_end:
             if ou is not None:
                 ge_now, gi_now, ge_next, gi_next = ou.step_pair()
@@ -572,12 +583,7 @@ def run_network(
 
             step += 1
 
-        # end of chunk: write shard exactly with global step index for its first kept row
         if writer is not None and n_keep > 0:
-            # the first kept global step in this chunk is chunk_start + offset
-            first_global_step_kept = shard_start_step + ((-shard_start_step) % keep_every)
-            # BUT shard_start_step is the first step of the chunk; make it equal to the chunk's 'step' at entry
-            # We recorded 'step' above; reconstruct here:
             first_global_step_kept = (s_end - steps_in_chunk) + ((-(s_end - steps_in_chunk)) % keep_every)
             writer.write_chunk(first_global_step_kept, V_buf_cpu)
 
@@ -587,7 +593,6 @@ def run_network(
     sim_time = time.perf_counter() - t_sim
     logger.info(f"[total] simulated {T_steps} steps in {sim_time:.3f}s")
     return {"sim_seconds": sim_time}
-
 
 # =========================================
 # CLI
@@ -604,7 +609,15 @@ def build_argparser():
     ap.add_argument("--tag", type=str, default="run")
     ap.add_argument("--decimate", type=int, default=1, help="keep every k-th sample in output shards")
     ap.add_argument("--chunk_steps", type=int, default=48000, help="steps per output shard")
-    ap.add_argument("--no_compile", action="store_true", help="disable torch.compile")
+
+    # compile controls
+    ap.add_argument("--compile", action="store_true", help="compile positional core with torch.compile")
+    ap.add_argument("--backend", type=str, default="eager", choices=["eager", "inductor"], help="torch.compile backend")
+    ap.add_argument("--mode", type=str, default="max-autotune", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+    ap.add_argument("--suppress-compile-errors", action="store_true", help="suppress Dynamo/Inductor errors and fall back to eager")
+
+    # legacy flag, ignored if --compile is set
+    ap.add_argument("--no_compile", action="store_true", help="legacy: do not compile")
     return ap
 
 def main():
@@ -614,38 +627,42 @@ def main():
 
     logger = setup_logger(outdir / f"{args.tag}.log")
 
-    device = _dev()
-    logger.info(f"device: {device} | torch {torch.__version__}")
+    # Decide compile policy
+    compile_enabled = args.compile and not args.no_compile
+    logger.info(f"device: {_dev()} | torch {torch.__version__} | compile={compile_enabled} backend={args.backend}")
 
-    # torch.compile toggle
-    if args.no_compile and hasattr(hh_step_second_order, "compiler_fn"):
-        logger.info("Disabling compiled kernel per flag")
-        # Can't un-compile easily; just warn. Next run use --no_compile at import time if you care.
+    # Set suppress_errors if asked (lets you run even if Triton/toolchain explodes)
+    if args.suppress_compile_errors:
+        try:
+            import torch._dynamo as _dynamo
+            _dynamo.config.suppress_errors = True
+            logger.info("Dynamo suppress_errors=True")
+        except Exception:
+            logger.warning("Could not enable torch._dynamo.config.suppress_errors")
+
+    # Swap in compiled positional core if requested
+    global HH_STEP_IMPL
+    HH_STEP_IMPL = _hh_step_pos
+    if compile_enabled:
+        try:
+            HH_STEP_IMPL = torch.compile(_hh_step_pos, dynamic=True, mode=args.mode, backend=args.backend)
+            logger.info("Compiled positional core with torch.compile")
+        except Exception as e:
+            logger.warning(f"torch.compile failed at wrap time; falling back to eager. Reason: {e}")
+            HH_STEP_IMPL = _hh_step_pos
 
     # Connectivity
     with Timer(logger, "build connectivity"):
         A_signed, Apos, Aneg, is_inh = random_signed_adjacency_3to1(
-            args.N, p_conn=args.p_conn, w_exc=(0.001, 0.05), w_inh=(0.01, 0.05),
-            seed=1337, device=device, return_sparse=True
+            N=args.N, p_conn=args.p_conn, w_exc=(0.001, 0.05), w_inh=(0.01, 0.05),
+            seed=1337, device=_dev(), return_sparse=True
         )
 
     # OU source (streamed)
     with Timer(logger, "init OU source"):
-        # ou = OUSource(
-        #     N=args.N,
-        #     ge0=0.012, gi0=0.057,
-        #     tau_e_ms=2.7, tau_i_ms=10.5,
-        #     De=(0.003**2)/2.7,
-        #     Di=(0.066**2)/10.5,
-        #     dt_ms=args.dt,
-        #     seed=args.seed,
-        #     device=device,
-        #     dtype=torch.float32,
-        # )
         Gbg = 0.069
-        rho = neutral_rho(-65.0)  # find a neautral ratio...
+        rho = neutral_rho(-65.0)
         ge0, gi0, De, Di = compute_bg_from_ratio(rho, Gbg, tau_e=2.7, tau_i=10.5, CVe=0.3, CVi=0.3)
-
         ou = OUSource(
             N=args.N,
             ge0=ge0, gi0=gi0,
@@ -653,17 +670,13 @@ def main():
             De=De, Di=Di,
             dt_ms=args.dt,
             seed=args.seed,
-            device=device,
+            device=_dev(),
             dtype=torch.float32,
         )
 
-    # Params
     params = rsa_default_params()
-
-    # Writer
     writer = NPZShardWriter(outdir, base=args.tag, dt_ms=args.dt, decimate=args.decimate, logger=logger)
 
-    # Run
     stats = run_network(
         T_ms=args.T,
         dt_ms=args.dt,
@@ -673,12 +686,12 @@ def main():
         V0=-65.0,
         jitter=3.0,
         ou=ou,
-        Iext_callable=None,  # or provide a function(step)->(I_now, I_next)
+        Iext_callable=None,
         A_signed=A_signed,
         Vsyn_e=20.0, Vsyn_i=-80.0,
         sr_ms=0.5, sd_ms=8.0, Vth_rel=-20.0, krel=2.0,
         seed=args.seed,
-        device=device,
+        device=_dev(),
         dtype=torch.float32,
         chunk_steps=args.chunk_steps,
         decimate=args.decimate,
